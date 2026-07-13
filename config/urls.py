@@ -1,0 +1,182 @@
+import base64
+import html
+import os
+import re
+
+from django.contrib import admin
+from django.http import HttpResponse
+from django.urls import path
+from django.views.decorators.csrf import csrf_exempt
+from google import genai
+
+from config.coupons import COUPONS
+from config.gemini_prompts import GEMINI_FOOTER, build_question
+
+TITLE_MAX_LEN = 25
+BODY_MAX_LEN = 1000
+MAX_RETRIES = 3
+
+PAGE_HTML = """
+TEST<br>
+<button type="button" id="createBtn">作成</button>
+<span id="spinner" style="display:none;">
+  <span style="
+    display:inline-block; width:16px; height:16px; margin-left:8px;
+    border:3px solid #ccc; border-top-color:#333; border-radius:50%;
+    animation:spin 0.8s linear infinite; vertical-align:middle;"></span>
+  作成中...
+</span>
+<div id="result"></div>
+<style>
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+<script>
+function copyGeneratedText(btn) {
+    var textarea = btn.previousElementSibling;
+    navigator.clipboard.writeText(textarea.value).then(function () {
+        var original = btn.textContent;
+        btn.textContent = "コピーしました";
+        setTimeout(function () { btn.textContent = original; }, 1500);
+    });
+}
+
+document.getElementById("createBtn").addEventListener("click", function () {
+    var btn = document.getElementById("createBtn");
+    var spinner = document.getElementById("spinner");
+    var result = document.getElementById("result");
+    btn.style.display = "none";
+    spinner.style.display = "inline-block";
+    result.innerHTML = "";
+    fetch(window.location.pathname, { method: "POST" })
+        .then(function (res) { return res.text(); })
+        .then(function (html) { result.innerHTML = html; })
+        .catch(function (err) { result.innerHTML = "<p>エラー: " + err + "</p>"; })
+        .finally(function () {
+            spinner.style.display = "none";
+            btn.style.display = "inline-block";
+        });
+});
+</script>
+"""
+
+
+def ask_gemini(client, prompt: str) -> str:
+    response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+    return response.text.strip()
+
+
+def split_title_body(text: str) -> tuple[str, str]:
+    lines = text.strip().splitlines()
+    title_line = lines[0].strip()
+    body = "\n".join(lines[1:]).strip()
+    # 「タイトル（N文字）」の（N文字）表記を取り除いて実際のタイトル文だけにする
+    title = re.sub(r"[（(]\s*\d+\s*文字[）)]\s*$", "", title_line).strip()
+    return title, body
+
+
+def generate_article(client, coupon: dict) -> tuple[str, str]:
+    text = ask_gemini(client, build_question(coupon["title"], coupon["body"]))
+    title, body = split_title_body(text)
+
+    for _ in range(MAX_RETRIES):
+        if len(title) <= TITLE_MAX_LEN:
+            break
+        title = ask_gemini(
+            client,
+            f"以下のタイトルを、意味を変えずに{TITLE_MAX_LEN}文字以内になるよう短く調整してください。"
+            f"調整後のタイトルの文字列だけを出力してください。\n\nタイトル: {title}",
+        )
+        title = re.sub(r"[（(]\s*\d+\s*文字[）)]\s*$", "", title.strip()).strip()
+
+    for _ in range(MAX_RETRIES):
+        if len(body) <= BODY_MAX_LEN:
+            break
+        body = ask_gemini(
+            client,
+            f"以下の本文を、■の見出し構成を保ったまま、{BODY_MAX_LEN}文字以内になるよう短く調整してください。"
+            f"調整後の本文だけを出力してください。\n\n本文:\n{body}",
+        )
+
+    return title, body
+
+
+def generate_ticket_image(client, title: str, body: str) -> tuple[bytes, str] | None:
+    prompt = (
+        "以下のサロンサービスの内容をイメージした、チケット風のイラストを1枚生成してください。"
+        "横長(16:9程度のワイドなアスペクト比)のイラストにしてください。"
+        "文字やロゴは入れず、イラストのみにしてください。\n\n"
+        f"タイトル: {title}\n本文: {body}"
+    )
+    response = client.models.generate_content(model="gemini-2.5-flash-image", contents=prompt)
+    for part in response.candidates[0].content.parts:
+        if part.inline_data is not None:
+            return part.inline_data.data, part.inline_data.mime_type
+    return None
+
+
+def error_block(label: str, error_text: str) -> str:
+    return (
+        f"<p>{label}: {html.escape(error_text)}</p>"
+        f'<textarea style="display:none;">{html.escape(f"{label}: {error_text}")}</textarea>'
+        '<button type="button" onclick="copyGeneratedText(this)">コピー</button>'
+    )
+
+
+def render_one(client, index: int, coupon: dict) -> str:
+    title = body = None
+    try:
+        title, body = generate_article(client, coupon)
+        footer = GEMINI_FOOTER.replace("\n", "<br>")
+        body_html = body.replace("\n", "<br>")
+        full_text = f"{title}\n\n{body}\n\n{GEMINI_FOOTER}"
+        text_html = (
+            f"<p>{title}<br><br>{body_html}<br><br>{footer}</p>"
+            f'<textarea style="display:none;">{html.escape(full_text)}</textarea>'
+            '<button type="button" onclick="copyGeneratedText(this)">コピー</button>'
+        )
+    except Exception as e:
+        text_html = error_block("テキスト生成エラー", str(e))
+
+    image_html = ""
+    if title is not None:
+        try:
+            image_result = generate_ticket_image(client, title, body)
+            if image_result:
+                image_bytes, mime_type = image_result
+                b64 = base64.b64encode(image_bytes).decode("ascii")
+                image_html = (
+                    f'<img src="data:{mime_type};base64,{b64}" '
+                    'style="width:100%; max-width:480px; height:auto; display:block;">'
+                )
+            else:
+                image_html = error_block("画像生成エラー", "応答に画像が含まれていませんでした")
+        except Exception as e:
+            image_html = error_block("画像生成エラー", str(e))
+
+    return (
+        f"<h3>{index}件目</h3>"
+        '<div style="display:flex; gap:24px; align-items:flex-start; flex-wrap:wrap;">'
+        f'<div style="flex:1; min-width:280px;">{text_html}</div>'
+        f'<div style="flex:0 0 auto; width:480px; max-width:100%;">{image_html}</div>'
+        "</div><hr>"
+    )
+
+
+@csrf_exempt
+def test_view(request):
+    if request.method == "POST":
+        try:
+            client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        except Exception as e:
+            return HttpResponse(error_block("Geminiクライアント作成エラー", str(e)))
+
+        blocks = [render_one(client, i, coupon) for i, coupon in enumerate(COUPONS, 1)]
+        return HttpResponse("".join(blocks))
+
+    return HttpResponse(PAGE_HTML)
+
+
+urlpatterns = [
+    path("admin/", admin.site.urls),
+    path("", test_view),
+]

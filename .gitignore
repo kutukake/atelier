@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.sqlite3
+.env
+staticfiles/
+media/
+.venv/
+*.log
+
+# ローカルのツール設定(コマンド許可リストに実行時の認証情報が残ることがあるため除外)
+.claude/
