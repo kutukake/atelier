@@ -18,6 +18,7 @@ from config.coupons import COUPONS
 from config.gemini_prompts import GEMINI_FOOTER, build_question
 
 TITLE_MAX_LEN = 25
+BODY_TARGET_LEN = 900
 BODY_MAX_LEN = 1000
 MAX_RETRIES = 3
 
@@ -105,11 +106,11 @@ def generate_article(client, coupon: dict) -> tuple[str, str]:
     title = truncate_text(title, TITLE_MAX_LEN)
 
     for _ in range(MAX_RETRIES):
-        if len(body) <= BODY_MAX_LEN:
+        if len(body) <= BODY_TARGET_LEN:
             break
         body = ask_gemini(
             client,
-            f"以下の本文を、■の見出し構成を保ったまま、{BODY_MAX_LEN}文字以内になるよう短く調整してください。"
+            f"以下の本文を、■の見出し構成を保ったまま、{BODY_TARGET_LEN}文字以内になるよう短く調整してください。"
             f"調整後の本文だけを出力してください。\n\n本文:\n{body}",
         )
     body = truncate_text(body, BODY_MAX_LEN)
@@ -117,11 +118,10 @@ def generate_article(client, coupon: dict) -> tuple[str, str]:
     return title, body
 
 
-IMAGE_TARGET_SIZE = (400, 600)
 BACKGROUND_CROP_TOLERANCE = 30
 
 
-def crop_background(image_bytes: bytes, target_size: tuple[int, int]) -> bytes:
+def crop_background(image_bytes: bytes) -> bytes:
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     width, height = image.size
     corners = [
@@ -139,10 +139,9 @@ def crop_background(image_bytes: bytes, target_size: tuple[int, int]) -> bytes:
     bbox = mask.getbbox()
 
     cropped = image.crop(bbox) if bbox else image
-    resized = cropped.resize(target_size, Image.LANCZOS)
 
     buffer = io.BytesIO()
-    resized.save(buffer, format="PNG")
+    cropped.save(buffer, format="PNG")
     return buffer.getvalue()
 
 
@@ -157,12 +156,12 @@ def generate_ticket_image(client, title: str, body: str) -> tuple[bytes, str] | 
         model="gemini-2.5-flash-image",
         contents=prompt,
         config=types.GenerateContentConfig(
-            image_config=types.ImageConfig(aspect_ratio="3:4"),
+            image_config=types.ImageConfig(aspect_ratio="16:9"),
         ),
     )
     for part in response.candidates[0].content.parts:
         if part.inline_data is not None:
-            cropped_bytes = crop_background(part.inline_data.data, IMAGE_TARGET_SIZE)
+            cropped_bytes = crop_background(part.inline_data.data)
             return cropped_bytes, "image/png"
     return None
 
