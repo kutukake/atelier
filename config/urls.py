@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import base64
 import html
+import io
 import os
 import re
 
@@ -8,6 +11,8 @@ from django.http import HttpResponse
 from django.urls import path
 from django.views.decorators.csrf import csrf_exempt
 from google import genai
+from google.genai import types
+from PIL import Image, ImageChops
 
 from config.coupons import COUPONS
 from config.gemini_prompts import GEMINI_FOOTER, build_question
@@ -61,7 +66,7 @@ document.getElementById("createBtn").addEventListener("click", function () {
 
 
 def ask_gemini(client, prompt: str) -> str:
-    response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+    response = client.models.generate_content(model="gemini-flash-latest", contents=prompt)
     return response.text.strip()
 
 
@@ -72,6 +77,16 @@ def split_title_body(text: str) -> tuple[str, str]:
     # 「タイトル（N文字）」の（N文字）表記を取り除いて実際のタイトル文だけにする
     title = re.sub(r"[（(]\s*\d+\s*文字[）)]\s*$", "", title_line).strip()
     return title, body
+
+
+def truncate_text(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    truncated = text[:max_len]
+    last_newline = truncated.rfind("\n")
+    if last_newline > 0:
+        truncated = truncated[:last_newline]
+    return truncated.rstrip()
 
 
 def generate_article(client, coupon: dict) -> tuple[str, str]:
@@ -87,6 +102,7 @@ def generate_article(client, coupon: dict) -> tuple[str, str]:
             f"調整後のタイトルの文字列だけを出力してください。\n\nタイトル: {title}",
         )
         title = re.sub(r"[（(]\s*\d+\s*文字[）)]\s*$", "", title.strip()).strip()
+    title = truncate_text(title, TITLE_MAX_LEN)
 
     for _ in range(MAX_RETRIES):
         if len(body) <= BODY_MAX_LEN:
@@ -96,21 +112,58 @@ def generate_article(client, coupon: dict) -> tuple[str, str]:
             f"以下の本文を、■の見出し構成を保ったまま、{BODY_MAX_LEN}文字以内になるよう短く調整してください。"
             f"調整後の本文だけを出力してください。\n\n本文:\n{body}",
         )
+    body = truncate_text(body, BODY_MAX_LEN)
 
     return title, body
+
+
+IMAGE_TARGET_SIZE = (400, 600)
+BACKGROUND_CROP_TOLERANCE = 30
+
+
+def crop_background(image_bytes: bytes, target_size: tuple[int, int]) -> bytes:
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    width, height = image.size
+    corners = [
+        image.getpixel((0, 0)),
+        image.getpixel((width - 1, 0)),
+        image.getpixel((0, height - 1)),
+        image.getpixel((width - 1, height - 1)),
+    ]
+    bg_color = tuple(sum(c[i] for c in corners) // len(corners) for i in range(3))
+
+    diff = ImageChops.difference(image, Image.new("RGB", image.size, bg_color))
+    r, g, b = diff.split()
+    max_diff = ImageChops.lighter(ImageChops.lighter(r, g), b)
+    mask = max_diff.point(lambda p: 255 if p > BACKGROUND_CROP_TOLERANCE else 0)
+    bbox = mask.getbbox()
+
+    cropped = image.crop(bbox) if bbox else image
+    resized = cropped.resize(target_size, Image.LANCZOS)
+
+    buffer = io.BytesIO()
+    resized.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def generate_ticket_image(client, title: str, body: str) -> tuple[bytes, str] | None:
     prompt = (
         "以下のサロンサービスの内容をイメージした、チケット風のイラストを1枚生成してください。"
-        "横長(16:9程度のワイドなアスペクト比)のイラストにしてください。"
+        "背景は白色の無地(模様や陰影のない単色)にしてください。"
         "文字やロゴは入れず、イラストのみにしてください。\n\n"
         f"タイトル: {title}\n本文: {body}"
     )
-    response = client.models.generate_content(model="gemini-2.5-flash-image", contents=prompt)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash-image",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            image_config=types.ImageConfig(aspect_ratio="3:4"),
+        ),
+    )
     for part in response.candidates[0].content.parts:
         if part.inline_data is not None:
-            return part.inline_data.data, part.inline_data.mime_type
+            cropped_bytes = crop_background(part.inline_data.data, IMAGE_TARGET_SIZE)
+            return cropped_bytes, "image/png"
     return None
 
 
