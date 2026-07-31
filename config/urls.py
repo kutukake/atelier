@@ -12,7 +12,7 @@ from django.urls import path
 from django.views.decorators.csrf import csrf_exempt
 from google import genai
 from google.genai import types
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageFilter
 
 from config.coupons import COUPONS
 from config.gemini_prompts import GEMINI_FOOTER, build_question
@@ -119,6 +119,8 @@ def generate_article(client, coupon: dict) -> tuple[str, str]:
 
 
 BACKGROUND_CROP_TOLERANCE = 30
+IMAGE_MIN_WIDTH = 480
+IMAGE_MIN_HEIGHT = 400
 
 
 def crop_background(image_bytes: bytes) -> bytes:
@@ -136,9 +138,18 @@ def crop_background(image_bytes: bytes) -> bytes:
     r, g, b = diff.split()
     max_diff = ImageChops.lighter(ImageChops.lighter(r, g), b)
     mask = max_diff.point(lambda p: 255 if p > BACKGROUND_CROP_TOLERANCE else 0)
+    # 孤立したノイズ画素がbboxを不必要に広げないよう、収縮フィルタで除去してから範囲を求める
+    mask = mask.filter(ImageFilter.MinFilter(7))
     bbox = mask.getbbox()
 
     cropped = image.crop(bbox) if bbox else image
+
+    width, height = cropped.size
+    scale = max(IMAGE_MIN_WIDTH / width, IMAGE_MIN_HEIGHT / height, 1.0)
+    if scale > 1.0:
+        cropped = cropped.resize(
+            (round(width * scale), round(height * scale)), Image.LANCZOS
+        )
 
     buffer = io.BytesIO()
     cropped.save(buffer, format="PNG")
@@ -149,7 +160,7 @@ def generate_ticket_image(client, title: str, body: str) -> tuple[bytes, str] | 
     prompt = (
         "以下のサロンサービスの内容をイメージした、チケット風のイラストを1枚生成してください。"
         "背景は白色の無地(模様や陰影のない単色)にしてください。"
-        "文字やロゴは入れず、イラストのみにしてください。\n\n"
+        "画像内にテキスト・文字・ロゴ・数字は一切含めないでください。イラストのみにしてください。\n\n"
         f"タイトル: {title}\n本文: {body}"
     )
     response = client.models.generate_content(
@@ -174,10 +185,10 @@ def error_block(label: str, error_text: str) -> str:
     )
 
 
-def render_one(client, index: int, coupon: dict) -> str:
+def render_one(text_client, image_client, index: int, coupon: dict) -> str:
     title = body = None
     try:
-        title, body = generate_article(client, coupon)
+        title, body = generate_article(text_client, coupon)
         footer = GEMINI_FOOTER.replace("\n", "<br>")
         body_html = body.replace("\n", "<br>")
         full_text = f"{title}\n\n{body}\n\n{GEMINI_FOOTER}"
@@ -192,7 +203,7 @@ def render_one(client, index: int, coupon: dict) -> str:
     image_html = ""
     if title is not None:
         try:
-            image_result = generate_ticket_image(client, title, body)
+            image_result = generate_ticket_image(image_client, title, body)
             if image_result:
                 image_bytes, mime_type = image_result
                 b64 = base64.b64encode(image_bytes).decode("ascii")
@@ -218,11 +229,15 @@ def render_one(client, index: int, coupon: dict) -> str:
 def test_view(request):
     if request.method == "POST":
         try:
-            client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+            text_client = genai.Client(api_key=os.environ["GEMINI_API_KEY_TEXT"])
+            image_client = genai.Client(api_key=os.environ["GEMINI_API_KEY_IMAGE"])
         except Exception as e:
             return HttpResponse(error_block("Geminiクライアント作成エラー", str(e)))
 
-        blocks = [render_one(client, i, coupon) for i, coupon in enumerate(COUPONS, 1)]
+        blocks = [
+            render_one(text_client, image_client, i, coupon)
+            for i, coupon in enumerate(COUPONS, 1)
+        ]
         return HttpResponse("".join(blocks))
 
     return HttpResponse(PAGE_HTML)
