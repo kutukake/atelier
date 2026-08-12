@@ -23,16 +23,23 @@ BODY_MAX_LEN = 1000
 MAX_RETRIES = 3
 
 PAGE_HTML = """
-TEST<br>
-<button type="button" id="createBtn">作成</button>
-<span id="spinner" style="display:none;">
-  <span style="
-    display:inline-block; width:16px; height:16px; margin-left:8px;
-    border:3px solid #ccc; border-top-color:#333; border-radius:50%;
-    animation:spin 0.8s linear infinite; vertical-align:middle;"></span>
-  作成中...
-</span>
-<div id="result"></div>
+<div style="max-width:640px; margin:40px auto; padding:0 20px; font-family:sans-serif; text-align:center;">
+  <h1 style="font-size:22px; margin-bottom:8px;">アトリエ横浜店 投稿コンテンツ作成</h1>
+  <p style="color:#666; margin-bottom:28px;">
+    ボタンを押すと、登録済みのクーポン内容をもとに紹介文とイメージ画像をまとめて生成します。
+  </p>
+  <button type="button" id="createBtn" style="
+    padding:12px 32px; font-size:16px; color:#fff; background:#3b82f6;
+    border:none; border-radius:6px; cursor:pointer;">作成</button>
+  <span id="spinner" style="display:none;">
+    <span style="
+      display:inline-block; width:16px; height:16px; margin-left:8px;
+      border:3px solid #ccc; border-top-color:#333; border-radius:50%;
+      animation:spin 0.8s linear infinite; vertical-align:middle;"></span>
+    作成中...
+  </span>
+</div>
+<div id="result" style="max-width:960px; margin:0 auto; padding:0 20px;"></div>
 <style>
 @keyframes spin { to { transform: rotate(360deg); } }
 </style>
@@ -189,12 +196,11 @@ def render_one(text_client, image_client, index: int, coupon: dict) -> str:
     title = body = None
     try:
         title, body = generate_article(text_client, coupon)
-        footer = GEMINI_FOOTER.replace("\n", "<br>")
-        body_html = body.replace("\n", "<br>")
         full_text = f"{title}\n\n{body}\n\n{GEMINI_FOOTER}"
         text_html = (
-            f"<p>{title}<br><br>{body_html}<br><br>{footer}</p>"
-            f'<textarea style="display:none;">{html.escape(full_text)}</textarea>'
+            '<textarea rows="14" style="width:100%; box-sizing:border-box; padding:8px; '
+            'font-family:inherit; font-size:14px;">'
+            f"{html.escape(full_text)}</textarea>"
             '<button type="button" onclick="copyGeneratedText(this)">コピー</button>'
         )
     except Exception as e:
